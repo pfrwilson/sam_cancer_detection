@@ -1,0 +1,15 @@
+**/__pycache__/**
+logs/
+.submitit/
+**/wandb/**
+**/.slurm_logs/**
+
+*.code-workspace
+./data/**
+data
+experiments/**
+
+**/*.log
+
+pyrightconfig.json
+```
