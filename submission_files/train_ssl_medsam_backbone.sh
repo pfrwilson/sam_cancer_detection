@@ -7,9 +7,9 @@
 #SBATCH --qos=m2
 #SBATCH --output=slurm-%j.log
 
-# send this batch script a SIGUSR1 60 seconds
+# send this batch script a SIGUSR1 120 seconds
 # before we hit our time limit
-#SBATCH --signal=B:USR1@60
+#SBATCH --signal=USR1@120
 
 # if [ -z ${RESUBMITTING} ]; then
 #     export RESUBMITTING=0
@@ -23,12 +23,12 @@ export TQDM_MININTERVAL=30
 
 
 handler() {
-    echo "function handler called at $(date)"
-    export RESUBMITTING=1
+    echo "SIGUSR1 at $(date)"
     sbatch ${BASH_SOURCE[0]}
 }
 
 trap handler SIGUSR1
 
 /h/pwilson/anaconda3/envs/ai/bin/python train_ssl_medsam_backbone.py \
-    --checkpoint-dir /scratch/ssd004/scratch/pwilson/checkpoints/train_ssl_medsam_backbone_v1 
+    --checkpoint-dir /scratch/ssd004/scratch/pwilson/checkpoints/train_ssl_medsam_backbone_v4 \
+    --lr 1e-5 
