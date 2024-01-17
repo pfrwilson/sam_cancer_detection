@@ -17,7 +17,8 @@ srun /h/pwilson/anaconda3/envs/ai/bin/python medsam_cancer_detection_corewise_si
     --epochs 40 \
     --benign-to-cancer-ratio 2 \
     --augmentation v2 \
-    --model-name finetune_backbone_linear_head_needle_region \
-    --name finetune_backbone_linear_head_needle_region 
+    --model-name backbone_image_wise_attention_pool \
+    --name backbone_image_wise_attention_pool 
+    #--load-encoder-checkpoint /h/pwilson/projects/sam_cancer_detection/checkpoints/train_ssl_medsam_backbone_v3/encoder_3.pth
 
     

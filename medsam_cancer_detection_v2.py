@@ -168,16 +168,15 @@ class Experiment(BasicExperiment):
                 involvement = torch.tensor(pct_cancer / 100).float()
                 return bmode, needle_mask, prostate_mask, label, involvement
 
-        from medAI.datasets import (
-            ExactNCT2013BModeImages,
-            CohortSelectionOptions,
+        from src.datasets_v2 import (
             ExactNCT2013BmodeImagesWithAutomaticProstateSegmentation,
+            KFoldCohortSelectionOptions,
         )
 
         train_ds = ExactNCT2013BmodeImagesWithAutomaticProstateSegmentation(
             split="train",
             transform=Transform(augment=self.config.augment),
-            cohort_selection_options=CohortSelectionOptions(
+            cohort_selection_options=KFoldCohortSelectionOptions(
                 benign_to_cancer_ratio=self.config.benign_cancer_ratio_for_training,
                 min_involvement=self.config.min_involvement_pct_training,
                 remove_benign_from_positive_patients=True,
@@ -188,7 +187,7 @@ class Experiment(BasicExperiment):
         val_ds = ExactNCT2013BmodeImagesWithAutomaticProstateSegmentation(
             split="val",
             transform=Transform(),
-            cohort_selection_options=CohortSelectionOptions(
+            cohort_selection_options=KFoldCohortSelectionOptions(
                 benign_to_cancer_ratio=None,
                 min_involvement=None,
                 fold=self.config.fold,
@@ -198,7 +197,7 @@ class Experiment(BasicExperiment):
         test_ds = ExactNCT2013BmodeImagesWithAutomaticProstateSegmentation(
             split="test",
             transform=Transform(),
-            cohort_selection_options=CohortSelectionOptions(
+            cohort_selection_options=KFoldCohortSelectionOptions(
                 benign_to_cancer_ratio=None,
                 min_involvement=None,
                 fold=self.config.fold,

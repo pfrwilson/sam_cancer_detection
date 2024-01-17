@@ -145,7 +145,7 @@ class MedSAMCancerDetectorV2(nn.Module):
     def __init__(self, medsam_checkpoint: str | None = None, freeze_backbone: bool=False):
         super().__init__()
         self.medsam_model = sam_model_registry["vit_b"](
-            checkpoint="/scratch/ssd004/scratch/pwilson/medsam_vit_b_cpu.pth"
+            checkpoint="/ssd005/projects/exactvu_pca/checkpoint_store/medsam_vit_b_cpu.pth"
         )
         if medsam_checkpoint is not None:
             self.medsam_model.load_state_dict(

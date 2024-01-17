@@ -10,6 +10,11 @@ from tqdm import tqdm
 from pathlib import Path
 from medAI.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 import os
+from rich_argparse import RichHelpFormatter
+import logging 
+logging.basicConfig(level=logging.INFO)
+
+
 torch.autograd.set_detect_anomaly(True)
 
 
@@ -28,24 +33,32 @@ class ModelFactory:
 def parse_args():
     from argparse import ArgumentParser
 
-    parser = ArgumentParser()
+    parser = ArgumentParser(formatter_class=RichHelpFormatter, description="Performs SSL training on MedSAM backbone")
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--benign-to-cancer-ratio", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--lr", type=float, default=1e-6)
     return parser.parse_args()
 
 
 def main(config):
+    logging.info("===========================================")
+    logging.info("Starting experiment")
+    logging.info("===========================================")
+    
+    logging.info(f"Config: {config}")
+
     state = None
     if config.checkpoint_dir is not None:
         config.checkpoint_dir.mkdir(exist_ok=True, parents=True)
         if "experiment.ckpt" in os.listdir(config.checkpoint_dir):
-            print("Loading from checkpoint")
+            logging.info(f"Loading from checkpoint found in {config.checkpoint_dir}")
             state = torch.load(config.checkpoint_dir / "experiment.ckpt")
 
+    logging.info("Loading data")
     train_loader, val_loader, test_loader = get_dataloaders(
         config.fold,
         config.n_folds,
@@ -53,15 +66,22 @@ def main(config):
         debug=config.debug,
         augmentation=None,
     )
+    logging.info(f"Train: {len(train_loader)} batches, {len(train_loader.dataset)} images")
+    logging.info(f"Val: {len(val_loader)} batches, {len(val_loader.dataset)} images")
+    logging.info(f"Test: {len(test_loader)} batches, {len(test_loader.dataset)} images")
 
+    logging.info("Building model")
     model = IBotStyleModel()
     torch.compile(model)
     model.cuda()
+    logging.info(f"Model <{model.__class__.__name__}> built: ")
+    logging.info(f"Parameters: {sum(p.numel() for p in model.parameters())}")
+    logging.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     if state is not None:
         model.load_state_dict(state["model"])
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-6)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     scheduler = LinearWarmupCosineAnnealingLR(
         optimizer,
         5 * len(train_loader),
@@ -75,12 +95,12 @@ def main(config):
         scheduler.load_state_dict(state["scheduler"])
 
     wandb.init(
-        project="sam_ssl_pretraining", 
-        config=config, 
-        dir=config.checkpoint_dir, 
-        id = state['wandb_id'] if state is not None else None
+        project="sam_ssl_pretraining",
+        config=config,
+        dir=config.checkpoint_dir,
+        id=state["wandb_id"] if state is not None else None,
     )
-    wandb.watch(model, log_freq=1)
+    wandb.watch(model, log_freq=100)
 
     start_epoch = state["epoch"] if state is not None else 0
 
@@ -100,7 +120,6 @@ def main(config):
             )
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
-            
             optimizer.zero_grad()
             loss = model(batch[0].cuda())
             loss.backward()
@@ -124,6 +143,22 @@ def do_ema_update(teacher, student, alpha=0.999):
         teacher_param.data.mul_(alpha).add_(1 - alpha, student_param.data)
 
 
+def sinkhorn(scores, eps=0.05, niters=3):
+    Q = torch.exp(scores / eps).T
+    Q /= torch.sum(Q)
+    K, B = Q.shape
+    u, r, c = (
+        torch.zeros(K, device=scores.device),
+        torch.ones(K, device=scores.device) / K,
+        torch.ones(B, device=scores.device) / B,
+    )
+    for _ in range(niters):
+        u = torch.sum(Q, dim=1)
+        Q *= (r / u).unsqueeze(1)
+        Q *= (c / torch.sum(Q, dim=0)).unsqueeze(0)
+    return (Q / torch.sum(Q, dim=0, keepdim=True)).T
+
+
 class IBotStyleModel(nn.Module):
     def __init__(
         self,
@@ -135,7 +170,7 @@ class IBotStyleModel(nn.Module):
         max_num_patches=100,
         mask_ratio=0.3,
         ema_alpha=0.999,
-        lambda_=20,
+        temp=1,
     ):
         super().__init__()
         self.mask_gen = MaskingGenerator(
@@ -152,7 +187,7 @@ class IBotStyleModel(nn.Module):
             param.requires_grad_(False)
 
         self.ema_alpha = ema_alpha
-        self.lambda_ = lambda_
+        self.temp = temp
 
     def generate_masks(self, image):
         masks = []
@@ -166,26 +201,16 @@ class IBotStyleModel(nn.Module):
             target_token_scores = self.teacher(image, mask=None)
             target_token_scores = target_token_scores.permute(0, 2, 3, 1)
             target_token_scores = target_token_scores[mask]
-
-            # compute target distributions - sinkhorn_knopp centering
-            n_targets, n_sources = target_token_scores.shape
-            target_row_sum = torch.ones((n_targets, 1)).cuda()
-            target_col_sum = torch.ones((n_sources, 1)).cuda() * n_targets / n_sources
-            K = torch.exp(target_token_scores * self.lambda_)
-            K = K.relu() # this is a hack to avoid negative values or NaNs
-            target_dist = sinkhorn_knopp(K, target_row_sum, target_col_sum, n_iters=3)
+            target_token_scores = sinkhorn(target_token_scores)
+            target_dist = (target_token_scores / self.temp).softmax(-1)
 
         student_token_scores = self.student(image, mask=mask)
         student_token_scores = student_token_scores.permute(0, 2, 3, 1)
         student_token_scores = student_token_scores[mask]
 
-         
         loss = torch.sum(
             -target_dist * torch.log_softmax(student_token_scores, dim=-1), dim=-1
         ).mean()
-
-        if torch.isnan(loss):
-            import IPython; IPython.embed()
 
         return loss
 

@@ -1,21 +1,26 @@
-from medAI.datasets import ExactNCT2013BModeImages, CohortSelectionOptions
+from src.datasets import ExactNCT2013BModeImages, CohortSelectionOptions
 import torch
 from torch import nn
 from einops import rearrange, repeat
 from dataclasses import dataclass
-from medAI.utils.lr_scheduler import LinearWarmupCosineAnnealingLR
+from src.utils import LinearWarmupCosineAnnealingLR
 from tqdm import tqdm
 import wandb
 import numpy as np
 from rich_argparse import RichHelpFormatter
 import argparse
+import random 
+
 
 
 class ModelRegistry:
     encoder_checkpoint = None
 
     @classmethod
-    def v0(cls):
+    def sam_backbone_average_linear(cls):
+        """
+        Uses the sam model backbone, but replaces the segmentation head with average pooling and a linear layer.
+        """
         from segment_anything import sam_model_registry
 
         sam_model = sam_model_registry["vit_b"](
@@ -128,6 +133,34 @@ class ModelRegistry:
     def v1_adapters_256_thaw_patch_embed(cls):
         return ModelRegistry._v1_adapters_thaw_patch_embed(256)
 
+    @classmethod 
+    def backbone_image_wise_attention_pool(cls): 
+        from src.sam import build_medsam
+        sam_model = build_medsam()
+        image_encoder = sam_model.image_encoder
+
+        if cls.encoder_checkpoint is not None:
+            print("Loading encoder checkpoint")
+            image_encoder.load_state_dict(torch.load(cls.encoder_checkpoint))
+
+        pool = SimpleAttentionPooling(256)
+        flatten = torch.nn.Flatten()
+        fc = torch.nn.Linear(256, 1)
+        model_ = torch.nn.Sequential(image_encoder, pool, flatten, fc)
+
+        class Model(nn.Module):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__()
+                self.model = model_
+
+            def forward(self, X, mask):
+                return model_(X)
+
+        model = Model()
+        criterion = nn.BCEWithLogitsLoss()
+        return model, criterion
+
+
 
 # all class methods that don't start with _
 _MODEL_NAMES = [
@@ -142,6 +175,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = ArgumentParser(formatter_class=RichHelpFormatter)
     parser.add_argument("--name", type=str, required=False, default=None)
+    parser.add_argument("--project", type=str, default="medsam_cancer_detection_corewise_simple", help="Wandb project name")
     parser.add_argument(
         "--debug", action="store_true", default=False, help="Debug mode"
     )
@@ -156,12 +190,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--augmentation", type=str, default="none", choices=("none", "v1", "v2")
     )
-    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--load-encoder-checkpoint", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
 
 def main(config):
+
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+
     train_loader, val_loader, test_loader = get_dataloaders(
         config.fold,
         config.n_folds,
@@ -322,7 +362,7 @@ def compute_metrics(pred_list, label_list, involvement_list):
 
 
 def get_dataloaders(
-    fold=0, n_folds=5, benign_to_cancer_ratio=None, debug=False, augmentation="none"
+    fold=0, n_folds=5, benign_to_cancer_ratio=None, debug=False, augmentation="none", batch_size=4
 ):
     class Transform:
         def __init__(self, augmentation="none"):
@@ -403,13 +443,13 @@ def get_dataloaders(
         test_ds = torch.utils.data.Subset(test_ds, np.arange(0, 16))
 
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=4, shuffle=True, num_workers=4, drop_last=True
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True
     )
     val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=4, shuffle=False, num_workers=4, drop_last=True
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=True
     )
     test_loader = torch.utils.data.DataLoader(
-        test_ds, batch_size=4, shuffle=False, num_workers=4, drop_last=True
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=True
     )
 
     return train_loader, val_loader, test_loader
@@ -557,6 +597,60 @@ class MedSAMClassifierBackboneOnly(nn.Module):
             pooled_outputs.append(outputs[batch_idx == i].mean(dim=0))
         pooled_outputs = torch.stack(pooled_outputs).squeeze(-1)
         return pooled_outputs
+
+
+class SimpleAttentionPooling(nn.Module): 
+    def __init__(self, features_dim):
+        super().__init__()
+        self.features_dim = features_dim
+        self.attention = nn.Linear(features_dim, 1)
+
+    def forward(self, X): 
+        B, C, H, W = X.shape 
+        X = rearrange(X, "b c h w -> b (h w) c")
+        attention_weights = self.attention(X)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+        X = X * attention_weights
+        X = X.sum(dim=1)
+        return X
+    
+
+
+
+# class MaskedAttentionPooling(nn.Module): 
+#     def __init__(self, features_dim, mask_threshold=0.5):
+#         super().__init__()
+#         self.features_dim = features_dim
+#         self.attention = nn.Linear(features_dim, 1)
+#         self.pad_token = nn.Parameter(torch.zeros(features_dim))
+#         self.mask_threshold = mask_threshold
+# 
+#     def forward(self, X, mask):
+#         B, C, H, W = X.shape 
+# 
+#         X = X.permute(0, 2, 3, 1)
+#         mask = torch.nn.functional.interpolate(
+#             mask, size=(H, W), mode="bilinear", align_corners=False
+#         )
+#         mask = mask > self.mask_threshold
+#         mask = mask.permute(0, 2, 3, 1)
+# 
+#         outputs = []
+#         for i in range(B): 
+#             x = X[i]
+#             m = mask[i]
+#             x = x[m]
+#             masked_features = x # masked_features.shape = (N, C)
+#             attention_weights = self.attention(masked_features) #(N, 1)
+#             attention_weights = torch.softmax(attention_weights, dim=0) #(N, 1)
+#             outputs.append(torch.sum(attention_weights * masked_features, dim=0))
+# 
+#         outputs = torch.stack(outputs)
+#         return outputs
+# 
+# 
+
+
 
 
 if __name__ == "__main__":
